@@ -1,42 +1,51 @@
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from django.db import models
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
-from .models import Profile, Block,Report,Conversation,Message
-from django.db import models
-from django.shortcuts import get_object_or_404
-from django.db.models import Q
 
+from .models import Profile, Block, Report, Conversation, Message
 from .serializers import (
-    RegisterSerializer, MeSerializer, PublicProfileSerializer,ProfileSerializer,
-    ProfileUpdateSerializer,BlockSerializer,BlockListItemSerializer,ReportSerializer,
-    ConversationSerializer,ConversationCreateSerializer,
+    RegisterSerializer, MeSerializer, PublicProfileSerializer, ProfileSerializer,
+    ProfileUpdateSerializer, BlockSerializer, BlockListItemSerializer, ReportSerializer,
+    ConversationSerializer, ConversationCreateSerializer,
     MessageSerializer, MessageCreateSerializer,
     PasswordResetRequestSerializer, PasswordResetConfirmSerializer,
-
 )
 
 User = get_user_model()
+
+# =========================
+# Auth
+# =========================
 
 class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = RegisterSerializer
 
-class MeView(APIView):
+class AuthMeView(APIView):
+    """
+    GET /api/auth/me/ -> { id, username, email, profile:{...} }
+    (Convenient for chat screens needing my user id/username quickly)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
     def get(self, request):
-        prof = request.user.profile
-        prof.last_active_at = timezone.now()
-        prof.save(update_fields=["last_active_at"])
-        return Response(MeSerializer(request.user).data)
+        return Response(MeSerializer(request.user, context={"request": request}).data)
 
 class LogoutView(APIView):
     """
-    Logout this device by blacklisting the provided refresh token.
-    Body: {"refresh": "<REFRESH_TOKEN>"}
+    POST /api/auth/logout/ -> body: {"refresh": "<REFRESH_TOKEN>"}
+    Blacklists the provided refresh token.
     """
+    permission_classes = [permissions.IsAuthenticated]
+
     def post(self, request):
         refresh = request.data.get("refresh")
         if not refresh:
@@ -50,27 +59,31 @@ class LogoutView(APIView):
 
 class LogoutAllView(APIView):
     """
-    Logout from all devices by blacklisting all outstanding tokens for the user.
+    POST /api/auth/logout_all/
+    Blacklists all outstanding tokens for the user (all devices).
     """
+    permission_classes = [permissions.IsAuthenticated]
+
     def post(self, request):
         tokens = OutstandingToken.objects.filter(user=request.user)
         for t in tokens:
             BlacklistedToken.objects.get_or_create(token=t)
         return Response(status=status.HTTP_205_RESET_CONTENT)
 
+# =========================
+# Profiles (Public lists + My profile)
+# =========================
+
 class ProfileListView(generics.ListAPIView):
     """
-    List other users with basic filters + free-text search.
-
-    Query params:
-      - q: space-separated terms matched across display_name, profession, bio, country, city, languages
-      - country: exact (case-insensitive)
-      - city: icontains
-      - profession: icontains
-      - language: icontains against JSON list
-      - exclude_blocked: default true; set false to disable
-
-    Sort: most recently active first, then user_id.
+    GET /api/profiles/
+      Filters:
+        - q: free text across name, profession, bio, country, city, languages
+        - country: exact (case-insensitive)
+        - city: icontains
+        - profession: icontains
+        - language: icontains (JSON text match)
+        - exclude_blocked=true (default)
     """
     serializer_class = PublicProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -82,12 +95,11 @@ class ProfileListView(generics.ListAPIView):
             .select_related("user")
             .only(
                 "user__id", "display_name", "country_of_origin", "current_city",
-                "profession", "languages", "bio", "last_active_at"
+                "profession", "languages", "bio", "last_active_at", "avatar"
             )
             .exclude(user=me)
         )
 
-        # ---- structured filters ----
         qp = self.request.query_params
         country = qp.get("country")
         city = qp.get("city")
@@ -103,10 +115,8 @@ class ProfileListView(generics.ListAPIView):
         if language:
             qs = qs.filter(languages__icontains=language.strip())
 
-        # ---- FREE-TEXT SEARCH (?q=) ----
         q = (qp.get("q") or "").strip()
         if q:
-            # every term must match at least one field (AND across terms, OR within fields)
             for term in [t for t in q.split() if t]:
                 t = term.strip()
                 qs = qs.filter(
@@ -115,10 +125,9 @@ class ProfileListView(generics.ListAPIView):
                     Q(bio__icontains=t) |
                     Q(country_of_origin__icontains=t) |
                     Q(current_city__icontains=t) |
-                    Q(languages__icontains=t)  # JSON list text match fallback
+                    Q(languages__icontains=t)
                 )
 
-        # ---- exclude blocked users (both directions) ----
         exclude_blocked = qp.get("exclude_blocked", "true").lower() != "false"
         if exclude_blocked:
             blocked_pairs = Block.objects.filter(Q(blocker=me) | Q(blocked=me)) \
@@ -132,6 +141,11 @@ class ProfileListView(generics.ListAPIView):
 
         return qs.order_by("-last_active_at", "user_id")
 
+    # Wrap as paginated object for the mobile client (even if not paginated server-side)
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        ser = self.get_serializer(qs, many=True, context={"request": request})
+        return Response({"count": qs.count(), "next": None, "previous": None, "results": ser.data})
 
 class ProfileDetailView(generics.RetrieveAPIView):
     serializer_class = PublicProfileSerializer
@@ -141,10 +155,46 @@ class ProfileDetailView(generics.RetrieveAPIView):
     def get_queryset(self):
         return Profile.objects.select_related("user").all()
 
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        ser = self.get_serializer(instance, context={"request": request})
+        return Response(ser.data)
+
+class MyProfileView(generics.RetrieveUpdateAPIView):
+    """
+    GET   /api/profiles/me/
+    PATCH /api/profiles/me/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProfileUpdateSerializer  # used for writes (PATCH)
+
+    def get_object(self):
+        return self.request.user.profile
+
+    def get(self, request, *args, **kwargs):
+        # bump last_active_at
+        prof = self.get_object()
+        prof.last_active_at = timezone.now()
+        prof.save(update_fields=["last_active_at"])
+        data = ProfileSerializer(prof, context={"request": request}).data
+        return Response({"profile": data})
+
+    def patch(self, request, *args, **kwargs):
+        prof = self.get_object()
+        ser = self.get_serializer(prof, data=request.data, partial=True, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        out = ProfileSerializer(prof, context={"request": request}).data
+        return Response({"profile": out})
+
+# =========================
+# Blocks
+# =========================
+
 class BlockListCreateView(generics.ListCreateAPIView):
     """
-    GET  /api/blocks/       -> list all users I blocked
-    POST /api/blocks/       -> block a user { "user_id": 123 }
+    GET  /api/blocks/
+    POST /api/blocks/  {"user_id": <int>}
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -161,10 +211,9 @@ class BlockListCreateView(generics.ListCreateAPIView):
         ctx["request"] = self.request
         return ctx
 
-
 class BlockDeleteView(APIView):
     """
-    DELETE /api/blocks/<user_id>/ -> unblock that user
+    DELETE /api/blocks/<user_id>/
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -174,12 +223,13 @@ class BlockDeleteView(APIView):
             return Response(status=status.HTTP_204_NO_CONTENT)
         return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-
-# --- REPORTS ---
+# =========================
+# Reports
+# =========================
 
 class ReportCreateView(generics.CreateAPIView):
     """
-    POST /api/reports/ -> { "reported_user_id": 123, "reason": "harassment", "details": "..." }
+    POST /api/reports/ -> { "reported_user_id": 123, "reason": "...", "details": "..." }
     """
     serializer_class = ReportSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -189,38 +239,48 @@ class ReportCreateView(generics.CreateAPIView):
         ctx["request"] = self.request
         return ctx
 
+# =========================
+# Conversations & Messages
+# =========================
+
 class ConversationListCreateView(generics.ListCreateAPIView):
     """
-    GET  /api/conversations/           -> my conversations
+    GET  /api/conversations/           -> my conversations (array)
     POST /api/conversations/ {user_id} -> create/get conversation with user
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         me = self.request.user
-        return (Conversation.objects
-                .filter(models.Q(user_a=me) | models.Q(user_b=me))
-                .select_related("user_a", "user_b")
-                .order_by("-last_message_at", "-created_at"))
+        return (
+            Conversation.objects
+            .filter(models.Q(user_a=me) | models.Q(user_b=me))
+            .select_related("user_a", "user_b", "user_a__profile", "user_b__profile")
+            .order_by("-last_message_at", "-created_at")
+        )
 
     def get_serializer_class(self):
         return ConversationCreateSerializer if self.request.method == "POST" else ConversationSerializer
 
     def get_serializer_context(self):
-        ctx = super().get_serializer_context()
-        ctx["request"] = self.request
-        return ctx
+        return {"request": self.request}
 
-    def perform_create(self, serializer):
-        self.instance = serializer.save()
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        ser = ConversationSerializer(qs, many=True, context={"request": request})
+        return Response(ser.data)
 
     def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        convo = serializer.save()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        user_id = ser.validated_data["user_id"]
+
+        # ensure participant order (small helper on model, or inline)
+        a, b = (request.user.id, user_id) if request.user.id < user_id else (user_id, request.user.id)
+        convo, _ = Conversation.objects.get_or_create(user_a_id=a, user_b_id=b)
+
         out = ConversationSerializer(convo, context={"request": request})
         return Response(out.data, status=status.HTTP_201_CREATED)
-
 
 class MessageListCreateView(generics.ListCreateAPIView):
     """
@@ -231,42 +291,56 @@ class MessageListCreateView(generics.ListCreateAPIView):
 
     def get_conversation(self):
         cid = self.kwargs["cid"]
-        convo = get_object_or_404(Conversation.objects.select_related("user_a", "user_b"), id=cid)
+        convo = get_object_or_404(
+            Conversation.objects.select_related("user_a", "user_b"),
+            id=cid
+        )
         me = self.request.user
         if me.id not in (convo.user_a_id, convo.user_b_id):
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+            return None
         return convo
 
     def get_queryset(self):
         convo = self.get_conversation()
-        if isinstance(convo, Response):
+        if convo is None:
             return Message.objects.none()
-        return (Message.objects
-                .filter(conversation=convo)
-                .select_related("sender")
-                .order_by("created_at"))
+        return (
+            Message.objects
+            .filter(conversation=convo)
+            .select_related("sender", "sender__profile")
+            .order_by("created_at")
+        )
 
     def get_serializer_class(self):
         return MessageCreateSerializer if self.request.method == "POST" else MessageSerializer
 
     def get_serializer_context(self):
-        ctx = super().get_serializer_context()
+        ctx = {"request": self.request}
         convo = self.get_conversation()
-        if isinstance(convo, Response):
-            return ctx
-        ctx["request"] = self.request
-        ctx["conversation"] = convo
+        if convo is not None:
+            ctx["conversation"] = convo
         return ctx
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        ser = MessageSerializer(qs, many=True, context={"request": request})
+        return Response({"count": qs.count(), "next": None, "previous": None, "results": ser.data})
 
     def create(self, request, *args, **kwargs):
         convo = self.get_conversation()
-        if isinstance(convo, Response):
-            return convo
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        msg = serializer.save()
-        return Response(MessageSerializer(msg).data, status=status.HTTP_201_CREATED)
+        if convo is None:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        # participant & block checks + save
+        create_ser = MessageCreateSerializer(data=request.data, context={"request": request, "conversation": convo})
+        create_ser.is_valid(raise_exception=True)
+        msg = Message.objects.create(conversation=convo, sender=request.user, body=create_ser.validated_data["body"])
+
+        # bump last_message_at
+        Conversation.objects.filter(id=convo.id).update(last_message_at=timezone.now())
+
+        out = MessageSerializer(msg, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)
 
 class ConversationMarkReadView(APIView):
     """
@@ -280,26 +354,19 @@ class ConversationMarkReadView(APIView):
         me = request.user
         if me.id not in (convo.user_a_id, convo.user_b_id):
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        # mark other-party messages as read
-        qs = Message.objects.filter(conversation=convo).exclude(sender=me).filter(is_read=False)
-        updated = qs.update(is_read=True, read_at=timezone.now())
+
+        updated = (
+            Message.objects
+            .filter(conversation=convo)
+            .exclude(sender=me)
+            .filter(is_read=False)
+            .update(is_read=True, read_at=timezone.now())
+        )
         return Response({"updated": updated}, status=status.HTTP_200_OK)
 
-class MyProfileView(generics.RetrieveUpdateAPIView):
-    """
-    GET   /api/profiles/me/     -> your profile
-    PATCH /api/profiles/me/     -> update your profile (partial)
-    """
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = ProfileUpdateSerializer  # for writes
-
-    def get_object(self):
-        return self.request.user.profile
-
-    def get(self, request, *args, **kwargs):
-        # Use read serializer for output consistency
-        prof = self.get_object()
-        return Response(ProfileSerializer(prof).data)
+# =========================
+# Password reset
+# =========================
 
 class PasswordResetRequestView(generics.GenericAPIView):
     permission_classes = [permissions.AllowAny]
@@ -308,10 +375,8 @@ class PasswordResetRequestView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        ser.save()
-        # Always return 200 for privacy
+        # implement email sending in serializer.save() if desired
         return Response({"detail": "If an account with that email exists, a reset link has been sent."})
-
 
 class PasswordResetConfirmView(generics.GenericAPIView):
     permission_classes = [permissions.AllowAny]
@@ -320,5 +385,5 @@ class PasswordResetConfirmView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        ser.save()
+        # implement password update in serializer.save() if desired
         return Response({"detail": "Password has been reset successfully."})
