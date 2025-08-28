@@ -1,7 +1,10 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.core.mail import send_mail
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.db import transaction
-from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
@@ -41,7 +44,7 @@ class RegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         profile_fields = {k: validated_data.pop(k, None) for k in ["display_name", "country_of_origin", "current_city", "languages"]}
         user = User.objects.create_user(**validated_data)
-        p = user.profile
+        p = user.profile  # ensured by signal
         p.display_name = profile_fields.get("display_name") or user.username
         p.country_of_origin = profile_fields.get("country_of_origin") or ""
         p.current_city = profile_fields.get("current_city") or ""
@@ -105,6 +108,7 @@ class BlockSerializer(serializers.ModelSerializer):
     class Meta:
         model = Block
         fields = ("user_id", "blocked_user", "created_at")
+        read_only_fields = ("created_at",)
 
     def get_blocked_user(self, obj):
         u = obj.blocked
@@ -141,6 +145,20 @@ class ReportSerializer(serializers.ModelSerializer):
     class Meta:
         model = Report
         fields = ("reported_user_id", "reason", "details", "created_at")
+        read_only_fields = ("created_at",)
+
+    def validate_reported_user_id(self, value):
+        request = self.context["request"]
+        if value == request.user.id:
+            raise serializers.ValidationError("You cannot report yourself.")
+        if not User.objects.filter(id=value).exists():
+            raise serializers.ValidationError("User does not exist.")
+        return value
+
+    def create(self, validated_data):
+        me = self.context["request"].user
+        reported = User.objects.get(id=validated_data.pop("reported_user_id"))
+        return Report.objects.create(reporter=me, reported_user=reported, **validated_data)
 
 # =========================
 # Tiny user payload for chat & conversations
@@ -230,7 +248,54 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
 class PasswordResetRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
+    def save(self, **kwargs):
+        email = self.validated_data["email"].strip().lower()
+        try:
+            user = User.objects.get(email__iexact=email)
+        except User.DoesNotExist:
+            return  # prevent user enumeration
+
+        token = PasswordResetTokenGenerator().make_token(user)
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+
+        from django.conf import settings
+        base = getattr(settings, "FRONTEND_RESET_URL", "homebridge://reset-password")
+        sep = "&" if "?" in base else "?"
+        reset_link = f"{base}{sep}uid={uid}&token={token}"
+
+        subject = "Reset your HomeBridge password"
+        body = (
+            f"Hello {getattr(user, 'username', 'there')},\n\n"
+            f"Tap the link below to reset your password:\n{reset_link}\n\n"
+            f"If you didn’t request this, you can ignore this email."
+        )
+        # DEFAULT_FROM_EMAIL will be used if sender is None
+        send_mail(subject, body, None, [email], fail_silently=False)
+
 class PasswordResetConfirmSerializer(serializers.Serializer):
     uid = serializers.CharField()
     token = serializers.CharField()
     new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
+
+    def save(self, **kwargs):
+        try:
+            uid_int = int(urlsafe_base64_decode(self.validated_data["uid"]).decode())
+        except Exception:
+            raise serializers.ValidationError({"uid": "Invalid uid"})
+
+        try:
+            user = User.objects.get(pk=uid_int)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({"uid": "Invalid user"})
+
+        token = self.validated_data["token"]
+        if not PasswordResetTokenGenerator().check_token(user, token):
+            raise serializers.ValidationError({"token": "Invalid or expired token"})
+
+        user.set_password(self.validated_data["new_password"])
+        user.save(update_fields=["password"])
+        return user

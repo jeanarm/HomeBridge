@@ -1,15 +1,11 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models import Q
 import uuid
-
 
 class Profile(models.Model):
     user = models.OneToOneField(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="profile",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile"
     )
     display_name = models.CharField(max_length=80)
     country_of_origin = models.CharField(max_length=20, blank=True)  # ISO-3166-1
@@ -25,26 +21,18 @@ class Profile(models.Model):
     def __str__(self):
         return self.display_name or getattr(self.user, "username", str(self.user_id))
 
-
 class Block(models.Model):
     blocker = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="blocks_made",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="blocks_made"
     )
     blocked = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="blocks_received",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="blocks_received"
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(
-                fields=("blocker", "blocked"),
-                name="unique_block_pair",
-            )
+            models.UniqueConstraint(fields=("blocker", "blocked"), name="unique_block_pair")
         ]
 
     def clean(self):
@@ -58,17 +46,12 @@ class Block(models.Model):
     def __str__(self):
         return f"{self.blocker_id} -> {self.blocked_id}"
 
-
 class Report(models.Model):
     reporter = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="reports_made",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="reports_made"
     )
     reported_user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="reports_received",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="reports_received"
     )
     reason = models.CharField(max_length=120)
     details = models.TextField(blank=True)
@@ -77,18 +60,13 @@ class Report(models.Model):
     def __str__(self):
         return f"Report by {self.reporter_id} on {self.reported_user_id}: {self.reason}"
 
-
 class Conversation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user_a = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="conversations_as_a",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations_as_a"
     )
     user_b = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="conversations_as_b",
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations_as_b"
     )
     created_at = models.DateTimeField(auto_now_add=True)
     last_message_at = models.DateTimeField(null=True, blank=True)
@@ -100,39 +78,28 @@ class Conversation(models.Model):
             models.Index(fields=["-last_message_at"]),
         ]
         constraints = [
-            # Uniqueness is enforced after we normalize (user_a, user_b) order in save()
-            models.UniqueConstraint(
-                fields=["user_a", "user_b"], name="unique_pair_ordered"
-            ),
+            models.UniqueConstraint(fields=["user_a", "user_b"], name="unique_pair_ordered"),
         ]
 
     def save(self, *args, **kwargs):
-        # enforce ordering so the pair is unique regardless of order
         if self.user_a_id and self.user_b_id and self.user_a_id > self.user_b_id:
             self.user_a_id, self.user_b_id = self.user_b_id, self.user_a_id
         super().save(*args, **kwargs)
 
     @staticmethod
     def for_users(u1_id: int, u2_id: int):
-        # normalize ordering
         a, b = (u1_id, u2_id) if u1_id < u2_id else (u2_id, u1_id)
         return Conversation.objects.filter(user_a_id=a, user_b_id=b)
 
     def __str__(self):
         return f"{self.user_a_id} ↔ {self.user_b_id}"
 
-
 class Message(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     conversation = models.ForeignKey(
-        Conversation,
-        on_delete=models.CASCADE,
-        related_name="messages",
+        Conversation, on_delete=models.CASCADE, related_name="messages"
     )
-    sender = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-    )
+    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     body = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
