@@ -1,4 +1,4 @@
-#!/home/armel/homebridge/.venv/bin/python3
+#!/Users/armel/Documents/ArmelProject/HomeBridge/.venv/bin/python3.13
 
 import sys
 import json
